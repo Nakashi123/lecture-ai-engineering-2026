@@ -5,11 +5,14 @@
 """
 
 import json
+from datetime import datetime, timezone
+from uuid import uuid4
 from functools import cache
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_RESULTS = 3
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 
 
 @cache
@@ -77,3 +80,43 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+
+def make_quiz(lecture: int) -> str:
+    """指定した回の用語から、復習用の確認問題を1問作る。
+
+    利用者が第N回の確認問題や小テストを求めたときに呼ぶ。
+    lecture は回番号（1以上の整数）。用語集にある定義のみを使う。
+    """
+    if lecture < 1:
+        return "回番号は1以上を指定してください。"
+    entries = [entry for entry in load_glossary() if entry["lecture"] == lecture]
+    if not entries:
+        return f"第{lecture}回の確認問題に使える用語がありません。"
+    entry = entries[0]  # 再現できるように決定的に選ぶ
+    return json.dumps(
+        {
+            "lecture": lecture,
+            "question": f"「{entry['term']}」とは何ですか？",
+            "answer": entry["definition"],
+        },
+        ensure_ascii=False,
+    )
+
+
+def save_learning_log(topic: str, content: str) -> str:
+    """学習の振り返りを learning_log/ に新しいMarkdownファイルとして保存する。
+
+    利用者が「記録して」「保存して」と明示した場合のみ使う。
+    保存は取り消しにくい操作なので、必ず利用者の承認を得てから実行する。
+    topic は記録の題名、content は記録したい学習内容。
+    """
+    topic, content = topic.strip(), content.strip()
+    if not topic or not content:
+        return "題名と学習内容の両方が必要なため、保存していません。"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = LOG_DIR / f"{timestamp}_{uuid4().hex[:12]}.md"
+    with path.open("x", encoding="utf-8") as file:
+        file.write(f"# {topic.replace(chr(10), ' ')}\n\n{content}\n")
+    return f"学習記録を {path.relative_to(LOG_DIR.parent)} に保存しました。"

@@ -16,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -35,14 +35,18 @@ INSTRUCTIONS = """\
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
+- 学習記録の保存を依頼された場合にだけ save_learning_log を使う。承認前に保存完了と伝えない。
+- 確認問題を求められた場合は make_quiz を使う。
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(instructions=INSTRUCTIONS, output_type=[str, DeferredToolRequests])
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
+agent.tool_plain(tools.make_quiz)
 
-# TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+# ファイルへの書き込みは必ず利用者の承認を待つ。
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -109,6 +113,37 @@ def print_trace(result) -> None:
     print(f"[usage] {result.usage}")
 
 
+
+def resume_with_user_approval(target: Agent, result, model):
+    """保留中の保存処理を CLI で確認してから再開する（入力なし・拒否は不承認）。"""
+    for _ in range(5):  # 異常な再要求で無限ループしない
+        if not isinstance(result.output, DeferredToolRequests):
+            return result
+
+        requests = result.output
+        if requests.calls:
+            raise RuntimeError("CLI が扱えない外部実行の保留要求を受け取りました。")
+
+        approvals = {}
+        for call in requests.approvals:
+            if call.tool_name != "save_learning_log":
+                raise RuntimeError(f"未対応の承認対象ツール: {call.tool_name}")
+            print("\n[保存前の確認] 次の内容を learning_log/ に保存しますか？")
+            print(json.dumps(call.args_as_dict(), ensure_ascii=False, indent=2))
+            try:
+                decision = input("保存を承認しますか？ [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                decision = ""
+            approvals[call.tool_call_id] = decision in {"y", "yes"}
+
+        result = target.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=DeferredToolResults(approvals=approvals),
+            model=model,
+        )
+    raise RuntimeError("承認待ちが繰り返されたため、実行を停止しました。")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="学習支援エージェントに質問する")
     parser.add_argument("question", nargs="?")
@@ -128,7 +163,9 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = target.run_sync(args.question, model=build_model())
+        model = build_model()
+        result = target.run_sync(args.question, model=model)
+        result = resume_with_user_approval(target, result, model)
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
